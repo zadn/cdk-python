@@ -8,9 +8,11 @@ from aws_cdk import (
     aws_eks as eks,
     aws_ec2 as ec2,
     aws_iam as iam,
+    aws_ssm as ssm,
     custom_resources as cr,
     aws_lambda as _lambda,
-    CfnOutput
+    CfnOutput,
+    CustomResource
 )
 from constructs import Construct
 
@@ -20,13 +22,14 @@ SSH_KEYPAIR_NAME = "eks-ssh-keypair"
 EKS_NODEGROUP_NAME = "cdk-eks-nodegroup"
 EKS_NODEGROUP_INSTANCE_TYPE = "t4g.small"
 SSM_PARAMETER_NAME = "/platform/account/env"
+SSM_PARAMETER_VALUE = "staging"
 ADD_TO_AWS_AUTH = {
     "iam_user_names": [
     ],
     "iam_role_names": [
     ]
 }
-CUSTOM_LAMBDA_FN_NAME = "custom-helm-lambda"
+CUSTOM_LAMBDA_FN_NAME = "CustomResourceLambda"
 
 class CdkPythonStack(Stack):
 
@@ -72,99 +75,79 @@ class CdkPythonStack(Stack):
                 username=iam_role_name
             )
 
-        # Lambda CustomResource Role
-        lambda_role = iam.Role(self, "Role",
-                               assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
-                               role_name=f"{CUSTOM_LAMBDA_FN_NAME}-role",
-                               description="Custom Helm Lambda Resource",
-                               inline_policies={
-                                   "eks_cluster_access": iam.PolicyDocument(
-                                       statements=[iam.PolicyStatement(
-                                           actions=["eks:DescribeCluster"],
-                                           resources=[cluster.cluster_arn]
-                                       )]
-                                   )
-                               }
-                               )
-        lambda_role.add_managed_policy(
-            iam.ManagedPolicy.from_aws_managed_policy_name(
-                managed_policy_name="service-role/AWSLambdaBasicExecutionRole"))
+        # --------------------------------------------------------------------------------------------------------------
 
-        # Allow the CustomResource Lambda role to access the cluster
-        cluster.aws_auth.add_masters_role(role=lambda_role, username=lambda_role.role_name)
-
-        # Create the Lambda function for the CustomResource
-        cust_res_lambda = _lambda.Function(
-            self, f'{CUSTOM_LAMBDA_FN_NAME}-{construct_id}',
-            runtime=_lambda.Runtime.PYTHON_3_10,
-            code=_lambda.Code.from_asset('resources/CustomHelmLambda'),
-            handler="lambda_function.lambda_handler",
-            function_name=CUSTOM_LAMBDA_FN_NAME,
-            role=lambda_role,
-            timeout=Duration.minutes(15)
+        ssm_parameter = ssm.StringParameter(
+            self, f"{SSM_PARAMETER_NAME}-{construct_id}",
+            parameter_name=SSM_PARAMETER_NAME,
+            description="Parameter which stores the environment to be used",
+            string_value=SSM_PARAMETER_VALUE
         )
-        cust_res_lambda.add_layers(KubectlV28Layer(self, "KubectlV28Layer"))
-        cust_res_lambda.add_layers(AwsCliLayer(self, "AwsCliLayer"))
 
-        # Fetch SSM Parameter with Boto3
-        client = boto3.client('ssm')
-        parameter = client.get_parameter(Name=SSM_PARAMETER_NAME)
-        parameter_value = parameter['Parameter']['Value']
-        CfnOutput(self, id=f"ParamValue-{construct_id}",
-                  value=str(parameter_value),
-                  export_name="ParamValue"
-                  )
+        lambda_role = iam.Role(
+            scope=self,
+            id=f"{CUSTOM_LAMBDA_FN_NAME}-role",
+            role_name=f"{CUSTOM_LAMBDA_FN_NAME}-role",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            inline_policies={
+                "SSMParameterAccessPolicy":
+                    iam.PolicyDocument(statements=[
+                        iam.PolicyStatement(
+                            actions=[
+                                "ssm:GetParameter"
+                            ],
+                            resources=[
+                                ssm_parameter.parameter_arn
+                            ],
+                            effect=iam.Effect.ALLOW,
+                        )
+                    ])
+            },
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AWSLambdaBasicExecutionRole")
+            ],
+        )
 
-        if parameter_value == "staging" or parameter_value == "production":
-            replica_count = 2
-        else:
-            replica_count = 1
+        # Lambda Function
+        cust_res_lambda = _lambda.Function(
+                self, f'{CUSTOM_LAMBDA_FN_NAME}-{construct_id}',
+                runtime=_lambda.Runtime.PYTHON_3_10,
+                code=_lambda.Code.from_asset('resources/LambdaCustomResource'),
+                handler="index.on_event",
+                function_name=CUSTOM_LAMBDA_FN_NAME,
+                role=lambda_role,
+                timeout=Duration.minutes(5)
+            )
 
-        CfnOutput(self, id=f"ReplicaCount",
-                  value=str(replica_count),
-                  export_name="ReplicaCount"
-                  )
+        # CustomResource
+        res_provider = cr.Provider(
+            self, f'crProvider-{construct_id}',
+            on_event_handler=cust_res_lambda
+        )
+        c_resource = CustomResource(
+            self, f'cust_res-{construct_id}',
+            service_token=res_provider.service_token,
+            properties={
+                "ssm_parameter_name": str(ssm_parameter.parameter_name)
+            }
+        )
+        cr_helm_values = c_resource.get_att('helm_values').to_string()
+        # CfnOutput(
+        #     self, id=f'HelmValues-{construct_id}',
+        #     value=cr_helm_values
+        # )
+
+        # --------------------------------------------------------------------------------------------------------------
 
         # Install Helm chart
+        helm_values = json.loads(cr_helm_values)
         nginx_helm_chart = eks.HelmChart(self, "NginxIngress",
                                          cluster=cluster,
                                          chart="nginx-ingress",
                                          release="nginx-ingress-controller",
                                          repository="https://helm.nginx.com/stable",
-                                         namespace="default"
+                                         namespace="default",
+                                         values=helm_values
                                          )
 
-        lambda_payload = {
-            "RequestType": "Update",
-            "ResourceType": "Custom::AWSCDK-EKS-HelmChart",
-            "ResourceProperties": {
-                "Repository": nginx_helm_chart.repository,
-                "Values": "{\"controller\":{\"replicaCount\":%s}}" % replica_count,
-                "ClusterName": cluster.cluster_name,
-                "Release": "nginx-ingress-controller",
-                "Chart": nginx_helm_chart.chart
-            }
-        }
-
-        # Define the AWSCustomResource
-        c_resource = cr.AwsCustomResource(
-            self,
-            f"CustomResource-{construct_id}",
-            on_update=cr.AwsSdkCall(
-                service="Lambda",
-                action="invoke",
-                physical_resource_id=cr.PhysicalResourceId.of("Trigger"),
-                parameters={
-                    "FunctionName": cust_res_lambda.function_name,
-                    "InvocationType": "RequestResponse",
-                    "Payload": json.dumps(lambda_payload)
-                }
-            ),
-            policy=cr.AwsCustomResourcePolicy.from_statements([
-                iam.PolicyStatement(
-                    actions=["lambda:InvokeFunction"],
-                    resources=[cust_res_lambda.function_arn]
-                )
-            ])
-        )
-        c_resource.node.add_dependency(nginx_helm_chart)
+        nginx_helm_chart.node.add_dependency(c_resource)
